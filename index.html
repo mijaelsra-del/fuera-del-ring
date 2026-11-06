@@ -152,64 +152,85 @@ kbd{font-family:ui-monospace,monospace;font-size:11px;background:var(--bg);borde
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 // Standalone online adapter: emulates the subset of the claude "room" API the game uses, over PeerJS (WebRTC).
-// Star topology: whoever first claims the room id is the hub and relays everyone's presence.
+// Star topology: ONLY the player who creates the room is the hub; guests only connect to it.
+// Every tab has a stable id (cid) so reconnects replace the old entry instead of duplicating it.
 (function(){
   const OPTS = Object.assign({ debug:0 }, window.__PEER_OPTS||{});
-  const PREFIX = 'fueradelring-v1-';
+  const PREFIX = 'fueradelring-v2-';
+  const rid=()=>Math.random().toString(36).slice(2,10)+Math.random().toString(36).slice(2,6);
+  let CID; try{ CID=sessionStorage.getItem('fdr-cid'); if(!CID){ CID=rid(); sessionStorage.setItem('fdr-cid',CID); } }catch(e){ CID=rid(); }
   let connected=false; const connHandlers=[];
   const setConn=v=>{ connected=v; connHandlers.forEach(h=>{ try{h(v)}catch(e){} }); };
-  // a probe peer only to report "connected to the server" in the menu
   let probe=null;
-  function ensureProbe(){ if(probe||!window.Peer) return; try{ probe=new Peer(undefined,OPTS); probe.on('open',()=>setConn(true)); probe.on('disconnected',()=>setConn(false)); probe.on('error',()=>{}); }catch(e){} }
+  function ensureProbe(){ if(probe||!window.Peer) return; try{ probe=new Peer(undefined,OPTS); probe.on('open',()=>setConn(true)); probe.on('disconnected',()=>{ setConn(false); try{probe.reconnect()}catch(e){} }); probe.on('error',()=>{}); }catch(e){} }
 
-  function makeRoom(name){
+  function makeRoom(name, wantHost){
     return new Promise((resolve,reject)=>{
-      const id=PREFIX+name; let peer=null, isHub=false, hubConn=null; const conns=new Map();
-      const state=new Map(); // peerId -> {presence, updatedAt}
-      let myId=null; const handlers=[]; let left=false; let errCb=[];
-      let flushT=null;
+      const hubId=PREFIX+name; let peer=null, hubConn=null, left=false, settled=false;
+      const state=new Map();            // cid -> {presence, updatedAt, seen}
+      const byConn=new Map();           // conn -> cid (hub only)
+      const handlers=[], errCb=[]; let flushT=null, hb=null, lastHub=0, retry=0;
+      const myId=CID; state.set(myId,{presence:{},updatedAt:Date.now(),seen:Date.now()});
+      const ok=v=>{ if(!settled){ settled=true; resolve(v); } }, ko=e=>{ if(!settled){ settled=true; cleanup(); reject(e); } };
       const snapshot=()=>{ const arr=[]; for(const [pid,v] of state) arr.push(Object.freeze({peer:pid,by:null,isMe:pid===myId,sameTab:pid===myId,kind:'viewer',guest:false,presence:Object.freeze(Object.assign({},v.presence)),updatedAt:v.updatedAt})); return Object.freeze(arr); };
       const emitPeers=()=>{ const peers=snapshot(); handlers.forEach(h=>{ try{h({peers,joined:[],left:[],updated:[]})}catch(e){} }); };
-      const merge=(pid,patch)=>{ const cur=state.get(pid)||{presence:{},updatedAt:0}; const p=Object.assign({},cur.presence); for(const k in patch){ if(patch[k]===null) delete p[k]; else p[k]=patch[k]; } state.set(pid,{presence:p,updatedAt:Date.now()}); };
-      const broadcast=()=>{ if(flushT) return; flushT=setTimeout(()=>{ flushT=null; const list=[]; for(const [pid,v] of state) list.push([pid,v.presence]); const msg={t:'peers',list}; for(const c of conns.values()) if(c.open) try{c.send(msg)}catch(e){} emitPeers(); },33); };
-      const fail=code=>{ errCb.forEach(f=>{ try{f({code,message:code})}catch(e){} }); };
-      const api={ name,
-        presence:async patch=>{ if(left) return; merge(myId,patch); if(isHub) broadcast(); else { emitPeers(); if(hubConn&&hubConn.open) try{hubConn.send({t:'p',patch})}catch(e){} } },
-        onPeers:(h,onErr)=>{ handlers.push(h); if(onErr) errCb.push(onErr); setTimeout(()=>h({peers:snapshot(),joined:[],left:[],updated:[]}),0); return ()=>{ const i=handlers.indexOf(h); if(i>=0) handlers.splice(i,1); }; },
-        peers:()=>snapshot(), connected:()=>!left&&!!peer&&!peer.disconnected, onConnection:(h)=>{ setTimeout(()=>h(true),0); return ()=>{}; },
-        emit:async()=>{}, on:()=>()=>{},
-        leave:async()=>{ left=true; try{ for(const c of conns.values()) c.close(); if(hubConn) hubConn.close(); peer&&peer.destroy(); }catch(e){} }
-      };
+      const merge=(pid,patch)=>{ const cur=state.get(pid)||{presence:{},updatedAt:0,seen:0}; const p=Object.assign({},cur.presence); for(const k in patch){ if(patch[k]===null) delete p[k]; else p[k]=patch[k]; } state.set(pid,{presence:p,updatedAt:Date.now(),seen:Date.now()}); };
+      const fail=code=>{ errCb.splice(0).forEach(f=>{ try{f({code,message:code})}catch(e){} }); };
+      const cleanup=()=>{ clearInterval(hb); try{ for(const c of byConn.keys()) c.close(); if(hubConn) hubConn.close(); if(peer) peer.destroy(); }catch(e){} };
+      // ---------- hub ----------
+      const broadcast=()=>{ if(flushT) return; flushT=setTimeout(()=>{ flushT=null; const list=[]; for(const [pid,v] of state) list.push([pid,v.presence]); const msg={t:'peers',list}; for(const c of byConn.keys()) if(c.open) try{c.send(msg)}catch(e){} emitPeers(); },33); };
+      const dropConn=c=>{ const cid=byConn.get(c); byConn.delete(c); try{c.close()}catch(e){}
+        if(cid && ![...byConn.values()].includes(cid)){ state.delete(cid); broadcast(); } };
       const asHub=()=>{
-        peer=new Peer(id,OPTS);
-        peer.on('open',pid=>{ isHub=true; myId=pid; state.set(myId,{presence:{},updatedAt:Date.now()}); resolve(api); });
+        peer=new Peer(hubId,OPTS);
+        peer.on('open',()=>{ ok(api);
+          hb=setInterval(()=>{ const now=Date.now(); for(const [c,cid] of byConn){ const s=state.get(cid); if(!c.open||!s||now-s.seen>9000) dropConn(c); else try{c.send({t:'ping'})}catch(e){} } },2500); });
         peer.on('connection',c=>{
-          c.on('open',()=>{ conns.set(c.peer,c); state.set(c.peer,state.get(c.peer)||{presence:{},updatedAt:Date.now()}); broadcast(); });
-          c.on('data',m=>{ if(m&&m.t==='p'&&m.patch&&typeof m.patch==='object'){ merge(c.peer,m.patch); broadcast(); } });
-          const gone=()=>{ conns.delete(c.peer); state.delete(c.peer); broadcast(); };
-          c.on('close',gone); c.on('error',gone);
+          c.on('data',m=>{ if(!m||typeof m!=='object') return;
+            if(m.t==='hello'&&typeof m.cid==='string'&&m.cid.length<40&&m.cid!==myId){
+              for(const [oc,ocid] of byConn) if(ocid===m.cid&&oc!==c){ byConn.delete(oc); try{oc.close()}catch(e){} }
+              byConn.set(c,m.cid); const cur=state.get(m.cid); state.set(m.cid,{presence:(m.presence&&typeof m.presence==='object')?m.presence:(cur?cur.presence:{}),updatedAt:Date.now(),seen:Date.now()}); broadcast(); return; }
+            const cid=byConn.get(c); if(!cid) return; const s=state.get(cid); if(s) s.seen=Date.now();
+            if(m.t==='p'&&m.patch&&typeof m.patch==='object'){ merge(cid,m.patch); broadcast(); } });
+          c.on('close',()=>dropConn(c)); c.on('error',()=>dropConn(c));
         });
-        peer.on('error',e=>{ if(e&&e.type==='unavailable-id'){ try{peer.destroy()}catch(_){ } asClient(); } else if(!myId) reject({code:'upstream_error',message:String(e&&e.type)}); });
-        peer.on('disconnected',()=>{ if(!left) try{peer.reconnect()}catch(e){} });
+        peer.on('error',e=>{ const t=e&&e.type; if(t==='unavailable-id') ko({code:'room_taken',message:'room_taken'}); else if(!settled) ko({code:'upstream_error',message:String(t)}); });
+        peer.on('disconnected',()=>{ if(!left) setTimeout(()=>{ try{ if(!left&&peer.disconnected&&!peer.destroyed) peer.reconnect(); }catch(e){} },800); });
       };
-      const asClient=()=>{
+      // ---------- guest ----------
+      const connectHub=()=>{
+        if(left) return; try{ if(hubConn) hubConn.close(); }catch(e){}
+        const c=peer.connect(hubId,{reliable:true}); hubConn=c; let opened=false;
+        const to=setTimeout(()=>{ if(!opened){ try{c.close()}catch(e){} again(); } },6000);
+        c.on('open',()=>{ opened=true; clearTimeout(to); retry=0; lastHub=Date.now(); const mine=state.get(myId); c.send({t:'hello',cid:myId,presence:mine?mine.presence:{}}); ok(api); });
+        c.on('data',m=>{ if(c!==hubConn) return; lastHub=Date.now(); if(m&&m.t==='peers'&&Array.isArray(m.list)){ const mine=state.get(myId); state.clear(); for(const it of m.list){ if(!Array.isArray(it)) continue; const [pid,p]=it; if(typeof pid!=='string') continue; state.set(pid,{presence:pid===myId&&mine?mine.presence:(p||{}),updatedAt:Date.now(),seen:Date.now()}); } if(mine) state.set(myId,mine); emitPeers(); } });
+        const lost=()=>{ if(c!==hubConn||left) return; clearTimeout(to); if(opened){ opened=false; again(); } };
+        c.on('close',lost); c.on('error',lost);
+      };
+      const again=()=>{ if(left) return; retry++;
+        if(!settled && retry>=4){ ko({code:'not_found',message:'not_found'}); return; }
+        if(settled && retry>=8){ const mine=state.get(myId); state.clear(); if(mine) state.set(myId,mine); emitPeers(); fail('upstream_error'); return; }
+        setTimeout(connectHub, settled?1500:2500); };
+      const asGuest=()=>{
         peer=new Peer(undefined,OPTS);
-        peer.on('open',pid=>{ myId=pid; state.set(myId,{presence:{},updatedAt:Date.now()});
-          hubConn=peer.connect(id,{reliable:true});
-          let opened=false; const to=setTimeout(()=>{ if(!opened) reject({code:'upstream_error',message:'timeout'}); },12000);
-          hubConn.on('open',()=>{ opened=true; clearTimeout(to); const mine=state.get(myId); if(mine&&Object.keys(mine.presence).length) hubConn.send({t:'p',patch:mine.presence}); resolve(api); });
-          hubConn.on('data',m=>{ if(m&&m.t==='peers'&&Array.isArray(m.list)){ const mine=state.get(myId); state.clear(); for(const [pid,p] of m.list) state.set(pid,{presence:pid===myId&&mine?mine.presence:p,updatedAt:Date.now()}); if(!state.has(myId)&&mine) state.set(myId,mine); emitPeers(); } });
-          const gone=()=>{ if(left) return; const mine=state.get(myId); state.clear(); if(mine) state.set(myId,mine); emitPeers(); fail('upstream_error'); };
-          hubConn.on('close',gone); hubConn.on('error',gone);
-        });
-        peer.on('error',e=>{ if(!myId||!hubConn||!hubConn.open) reject({code:'upstream_error',message:String(e&&e.type)}); });
+        peer.on('open',()=>{ connectHub();
+          hb=setInterval(()=>{ if(!settled||left) return; if(hubConn&&hubConn.open){ try{hubConn.send({t:'ping'})}catch(e){} } if(Date.now()-lastHub>9000&&hubConn&&hubConn.open){ try{hubConn.close()}catch(e){} again(); } },2500); });
+        peer.on('error',e=>{ const t=e&&e.type; if(t==='peer-unavailable'){ /* hub not there (yet): handled by retry timer */ return; } if(!settled) ko({code:'upstream_error',message:String(t)}); });
+        peer.on('disconnected',()=>{ if(!left) setTimeout(()=>{ try{ if(!left&&peer.disconnected&&!peer.destroyed) peer.reconnect(); }catch(e){} },800); });
       };
-      asHub();
+      const api={ name,
+        presence:async patch=>{ if(left) return; merge(myId,patch); if(wantHost) broadcast(); else { emitPeers(); if(hubConn&&hubConn.open) try{hubConn.send({t:'p',patch})}catch(e){} } },
+        onPeers:(h,onErr)=>{ handlers.push(h); if(onErr) errCb.push(onErr); setTimeout(()=>h({peers:snapshot(),joined:[],left:[],updated:[]}),0); return ()=>{ const i=handlers.indexOf(h); if(i>=0) handlers.splice(i,1); }; },
+        peers:()=>snapshot(), connected:()=>!left, onConnection:h=>{ setTimeout(()=>h(true),0); return ()=>{}; },
+        emit:async()=>{}, on:()=>()=>{},
+        leave:async()=>{ left=true; cleanup(); }
+      };
+      wantHost?asHub():asGuest();
     });
   }
   const lobby={
-    join:name=>makeRoom(name),
-    onConnection:(h,onErr)=>{ connHandlers.push(h); ensureProbe(); setTimeout(()=>h(connected),0); return ()=>{}; },
+    join:(name,opts)=>makeRoom(name,!!(opts&&opts.host)),
+    onConnection:(h)=>{ connHandlers.push(h); ensureProbe(); setTimeout(()=>h(connected),0); return ()=>{}; },
     onPeers:(h)=>{ setTimeout(()=>h({peers:[],joined:[],left:[],updated:[]}),0); return ()=>{}; },
     presence:async()=>{}, peers:()=>[], connected:()=>connected
   };
@@ -292,7 +313,7 @@ function renderOnline(){ const box=$('onlineBox');
     <button class="b2" id="leave" style="margin-top:10px">Salir de la sala</button></div>
     <div style="min-width:0"><div class="u2">En la sala</div><ul class="plist2" id="roomList"></ul></div></div>
     <p class="hint netst" id="netStatus"></p><p class="warn" id="noHost" hidden></p>
-    <p class="hint" style="margin-top:8px">${net.isHost?'Pasales el código. Cuando estén todos, tocá "A pelear".':'Ya estás adentro. Cuando el anfitrión arranque, aparece tu botón en la pantalla.'}</p>`;
+    <p class="hint" style="margin-top:8px">${net.isHost?'Pasales el código. Mantené el juego abierto en pantalla hasta que entren todos y tocá "A pelear".':'Ya estás adentro. Cuando el anfitrión arranque, aparece tu botón en la pantalla.'}</p>`;
   $('leave').onclick=leaveRoom; renderRoomList(); renderStatus();
   $('shareCopy').onclick=()=>{ const t=inviteText(); if(navigator.share){ navigator.share({text:t}).catch(()=>{}); return; } const ok=()=>{ $('copied').hidden=false; $('inviteBox').hidden=true; }, fail=()=>{ const tb=$('inviteBox'); tb.hidden=false; tb.focus(); tb.select(); $('copied').hidden=false; $('copied').textContent='Copiá este texto y mandáselo a tus amigos:'; };
     try{ navigator.clipboard.writeText(t).then(ok,fail); }catch(e){ fail(); } }; }
@@ -303,10 +324,11 @@ function renderRoomList(){ const ul=$('roomList'); if(!ul) return; const hs=huma
   if(humans().length>6) ul.innerHTML+='<li class="hint">La sala está llena: entran los primeros 6.</li>'; renderStatus();
   const nh=$('noHost'); if(nh){ const hostHere=humans().some(p=>p.presence.host); const alone=humans().length<=1;
     nh.hidden=net.isHost?!alone:hostHere;
-    nh.textContent=net.isHost?'Todavía no entró nadie. Fijate que tus amigos pongan exactamente el código '+net.code+'.':'En esta sala no hay anfitrión. Revisá que el código sea el mismo que tiene el que creó la sala, o elegí una de las salas abiertas.'; } }
+    nh.textContent=net.isHost?'Todavía no entró nadie. Mandales el link con Compartir sala y no cierres el juego mientras entran.':'Se perdió la conexión con el que creó la sala. Esperá unos segundos o salí y volvé a entrar.'; } }
 async function enterRoom(code,host){ const n=(($('nick')||{}).value||'').trim(); if(!n){ net.err='Poné un apodo.'; renderOnline(); return; }
   net.nick=n.slice(0,12); store.set('fdr-nick',net.nick); net.err=''; if(net.room){ try{ await net.room.leave(); }catch(e){} net.room=null; }
-  try{ net.room=await net.lobby.join('fdr-'+code.toLowerCase()); }catch(e){ net.room=null; net.err='No se pudo entrar a la sala ('+((e&&e.code)||'error')+'). Probá de nuevo.'; renderOnline(); return; }
+  if(!host){ net.err=''; const b=$('joinRoom'); if(b){ b.disabled=true; b.textContent='Buscando la sala…'; } }
+  try{ net.room=await net.lobby.join('fdr-'+code.toLowerCase(),{host}); }catch(e){ net.room=null; const c=e&&e.code; net.err= c==='not_found'?'No encontré la sala '+code+'. Revisá el código y que el que la creó tenga el juego abierto en pantalla.':c==='room_taken'?'Ese código ya está en uso. Tocá Crear sala de nuevo.':'No se pudo conectar ('+(c||'error')+'). Revisá tu internet y probá de nuevo.'; renderOnline(); return; }
   net.code=code; net.isHost=host;
   net.room.onPeers(ch=>{ net.peers=ch.peers; onPeers(); },()=>{ net.room=null; net.err='Se cortó la conexión con la sala.'; if(!game) renderMenu(); });
   net.room.presence({nick:net.nick,host,hold:false}).catch(()=>{}); pushLobbyPresence(); renderMenu(); }
